@@ -42,13 +42,46 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
-#include "semphr.h"
+#include "event_groups.h"
 
 #include "fsl_dac.h"
 #include "fsl_pit.h"
 
-#define NS 10
+#define NS 60
 #define CHARS 4
+
+#define EVENT_PIT (1<<0)
+#define EVENT_PING_PONG (1<<1)
+
+#define PIT_FS_HANDLER PIT0_IRQHandler
+#define PIT_IRQ_ID PIT0_IRQn
+#define USEC_TO_COUNT(us, clockFreqInHz) (uint64_t)((uint64_t)us * clockFreqInHz / 1000000U)
+#define PIT_SOURCE_CLOCK CLOCK_GetFreq(kCLOCK_BusClk)
+
+EventGroupHandle_t pingPong_events;
+QueueHandle_t pingPongA_buffer;
+QueueHandle_t pingPongB_buffer;
+
+volatile bool pitIsrFlag = false;
+
+void PIT_FS_HANDLER(void) {
+	/* Clear interrupt flag.*/
+	PIT_ClearStatusFlags(PIT, 0, kPIT_TimerFlag);
+	pitIsrFlag = true;
+
+//	BaseType_t xHigherPriorityTaskWoken;
+//	BaseType_t xResult;
+//
+//	xHigherPriorityTaskWoken = pdFALSE;
+//	xResult = pdFAIL;
+//	xResult = xEventGroupSetBits(pingPong_events,
+//	EVENT_PIT, &xHigherPriorityTaskWoken);
+//
+//	if (pdFAIL != xResult) {
+//		portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+//	}
+
+}
 
 static void server_thread(void *arg) {
 	struct netconn *conn;
@@ -59,79 +92,103 @@ static void server_thread(void *arg) {
 
 	uint16_t buffer_index = 0;
 	uint16_t len;
+	uint16_t outData_x;
 
 	LWIP_UNUSED_ARG(arg);
 	conn = netconn_new(NETCONN_UDP);
 	netconn_bind(conn, IP_ADDR_ANY, 5005);
 	//LWIP_ERROR("udpecho: invalid conn", (conn != NULL), return;);
 
-	dac_config_t dacConfigStruct;
-	uint16_t outData_x;
-	
-	SemaphoreHandle_t pingPong = xSemaphoreCreateBinary();
-
-	QueueHandle_t pingPongA_buffer = xQueueCreate(NS, sizeof(uint16_t));
-	QueueHandle_t pingPongB_buffer = xQueueCreate(NS, sizeof(uint16_t));
-
-	DAC_GetDefaultConfig(&dacConfigStruct);
-	DAC_Init(DAC0, &dacConfigStruct);
-	DAC_Enable(DAC0, true); /* Enable output. */
-
 	while (1) {
+
 		netconn_recv(conn, &buf);
 
 		if (ERR_OK == netbuf_data(buf, (void**) &msg, &len)) {
+
 			for (buffer_index = 0; buffer_index < len; buffer_index++) {
 				DAC_buffer[buffer_index] = *msg - '0';
 				msg++;
 			}
 
-			buffer_index = 0;
+			for (uint8_t Ns_index = 0; Ns_index < (NS * CHARS); Ns_index += 4) {
 
+				outData_x = (DAC_buffer[Ns_index + 0] * 1000
+						+ DAC_buffer[Ns_index + 1] * 100
+						+ DAC_buffer[Ns_index + 2] * 10
+						+ DAC_buffer[Ns_index + 3] * 1);
+
+				if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
+					xQueueSendToBack(pingPongA_buffer, &outData_x, 10);
+				} else {
+					xQueueSendToBack(pingPongB_buffer, &outData_x, 10);
+				}
+
+			}
+
+			if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
+				xEventGroupClearBits(pingPong_events, EVENT_PING_PONG);
+			} else {
+				xEventGroupSetBits(pingPong_events, EVENT_PING_PONG);
+			}
 		}
 
-		for (uint8_t Ns_index = 0; Ns_index < (NS * CHARS); Ns_index += 4) {
-
-			outData_x = (DAC_buffer[Ns_index + 0] * 1000
-					+ DAC_buffer[Ns_index + 1] * 100
-					+ DAC_buffer[Ns_index + 2] * 10
-					+ DAC_buffer[Ns_index + 3] * 1);
-			
-			xQueueSendToBack(pingPongA_buffer, outData_x, 10);
-		}
-
-		DAC_SetBufferValue(DAC0, 0U, (outData_x));
+buffer_index = 0;
 
 		netbuf_delete(buf);
 
 	}
 }
 
-/*-----------------------------------------------------------------------------------*/
-static void client_thread(void *arg) {
-	ip_addr_t dst_ip;
-	struct netconn *conn;
-	struct netbuf *buf;
+void PIT_task(void * arg) {
 
-	LWIP_UNUSED_ARG(arg);
-	conn = netconn_new(NETCONN_UDP);
-	//LWIP_ERROR("udpecho: invalid conn", (conn != NULL), return;);
+	dac_config_t dacConfigStruct;
+	pit_config_t pitConfig;
+	uint16_t outData_x;
 
-	char *msg = "Hello loopback!";
-	buf = netbuf_new();
-	netbuf_ref(buf, msg, 10);
+	pingPong_events = xEventGroupCreate();
+	pingPongA_buffer = xQueueCreate(NS, sizeof(uint16_t));
+	pingPongB_buffer = xQueueCreate(NS, sizeof(uint16_t));
 
-	IP4_ADDR(&dst_ip, 192, 168, 1, 100);
+	DAC_GetDefaultConfig(&dacConfigStruct);
+	DAC_Init(DAC0, &dacConfigStruct);
+	DAC_Enable(DAC0, true); /* Enable output. */
 
-	while (1) {
-		netconn_sendto(conn, buf, &dst_ip, 50005);
-		vTaskDelay(1000);
+	PIT_GetDefaultConfig(&pitConfig);
+
+	PIT_Init(PIT, &pitConfig);
+
+	/* Enable timer interrupts for channel 0 */
+	PIT_EnableInterrupts(PIT, kPIT_Chnl_0, kPIT_TimerInterruptEnable);
+
+	/* Enable at the NVIC */
+	EnableIRQ(PIT_IRQ_ID);
+
+	PIT_SetTimerPeriod(PIT, 0, USEC_TO_COUNT(23U, PIT_SOURCE_CLOCK));
+
+	PIT_StartTimer(PIT, kPIT_Chnl_0);
+
+	for (;;) {
+		if (true == pitIsrFlag) {
+			pitIsrFlag = false;
+
+			if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
+				xQueueReceive(pingPongB_buffer, &outData_x, 10);
+			} else {
+				xQueueReceive(pingPongA_buffer, &outData_x, 10);
+			}
+
+			DAC_SetBufferValue(DAC0, 0U, (outData_x));
+		}
+
 	}
 }
+
 /*-----------------------------------------------------------------------------------*/
 void udpecho_init(void) {
-	sys_thread_new("client", client_thread, NULL, 300, 1);
 	sys_thread_new("server", server_thread, NULL, 300, 2);
+
+	xTaskCreate(PIT_task, "PIT task", 200, NULL, configMAX_PRIORITIES,
+	NULL);
 
 }
 
