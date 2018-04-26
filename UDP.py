@@ -12,8 +12,8 @@ def int2bytes(i):
 
 print(int2bytes(255))
 
-DATA_L_MASK = 0x00FF
-DATA_H_MASK = 0xFF00
+DATA_L_MASK = 255
+DATA_H_MASK = 65000
 
 UDP_IP="192.168.1.100"
 UDP_PORT = 5005
@@ -55,10 +55,11 @@ else:
     for i in range(0, Ms):
         for j in range(0, Ns):
             data = struct.unpack("<h", waveFile.readframes(1))
-            Hexa_H = chr((data[0] & DATA_H_MASK) >> 8 )
+            hexval = (int((data[0] + 32675) * (273 / 4369)))
+            Hexa_H = chr((hexval & int(DATA_H_MASK)) >> 8)
             print(Hexa_H)
             data = struct.unpack("<h", waveFile.readframes(1))
-            Hexa_L = chr(data[0] & DATA_L_MASK)
+            Hexa_L = chr(hexval & int(DATA_L_MASK))
             print(Hexa_L)
             Packet = Packet + str(Hexa_H) + str(Hexa_L)
 
