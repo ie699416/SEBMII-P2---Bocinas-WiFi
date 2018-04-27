@@ -57,6 +57,7 @@
 
 #define EVENT_PIT (1<<0)
 #define EVENT_PING_PONG (1<<1)
+#define EVENT_BUFFER_EMPTY (1<<2)
 
 #define PIT_FS_HANDLER PIT0_IRQHandler
 #define PIT_IRQ_ID PIT0_IRQn
@@ -64,8 +65,7 @@
 #define PIT_SOURCE_CLOCK CLOCK_GetFreq(kCLOCK_BusClk)
 
 EventGroupHandle_t pingPong_events;
-QueueHandle_t pingPongA_buffer;
-QueueHandle_t pingPongB_buffer;
+QueueHandle_t pingPong_buffer;
 
 volatile bool pitIsrFlag = false;
 
@@ -93,9 +93,13 @@ static void server_thread(void *arg) {
 	struct netbuf *buf;
 
 	uint8_t *msg;
-	uint8_t DAC_buffer[BYTES * NS] = { };
+	uint8_t UDP_buffer[BYTES * NS] = { };
+	uint16_t DAC_buffer[NS] = { };
+	uint16_t * DAC_bufferA_ptr = pvPortMalloc(NS * sizeof(uint16_t));
+	uint16_t * DAC_bufferB_ptr = pvPortMalloc(NS * sizeof(uint16_t));
 
 	uint16_t buffer_index = 0;
+	uint16_t Ns_index = 0;
 	uint16_t len;
 	uint16_t outData_x;
 
@@ -129,50 +133,57 @@ static void server_thread(void *arg) {
 
 			for (buffer_index = 0; buffer_index < (NS * BYTES);
 					buffer_index++) {
-				DAC_buffer[buffer_index] = *msg;
+				UDP_buffer[buffer_index] = *msg;
 				msg++;
 			}
 
-			for (uint16_t Ns_index = 0; Ns_index < (NS * BYTES); Ns_index +=
-					BYTES) {
+			if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
 
-				outData_x = (DAC_buffer[Ns_index + 0]
-						+ (DAC_buffer[Ns_index + 1] << 8));
+				for (Ns_index = 0; Ns_index < (NS * BYTES); Ns_index +=
+				BYTES) {
 
-				if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
-					xQueueSendToBack(pingPongA_buffer, &outData_x, 10);
-				} else {
-					xQueueSendToBack(pingPongB_buffer, &outData_x, 10);
+					DAC_bufferA_ptr[Ns_index / 2] = (UDP_buffer[Ns_index + 0]
+							+ (UDP_buffer[Ns_index + 1] << 8));
 				}
 
-			}
-
-			if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
+				xQueueSendToBack(pingPong_buffer, &DAC_bufferA_ptr, 1);
 				xEventGroupClearBits(pingPong_events, EVENT_PING_PONG);
+
 			} else {
+
+				for (Ns_index = 0; Ns_index < (NS * BYTES); Ns_index +=
+				BYTES) {
+
+					DAC_bufferB_ptr[Ns_index / 2] = (UDP_buffer[Ns_index + 0]
+							+ (UDP_buffer[Ns_index + 1] << 8));
+				}
+
+				xQueueSendToBack(pingPong_buffer, &DAC_bufferB_ptr, 1);
 				xEventGroupSetBits(pingPong_events, EVENT_PING_PONG);
 			}
+
 		}
 
 		GPIO_WritePinOutput(GPIOA, 1, 0);
 
 		buffer_index = 0;
+		Ns_index = 0;
 
 		netbuf_delete(buf);
 
 	}
 }
 
-uint16_t outData_x;
-
 void PIT_task(void * arg) {
 
 	dac_config_t dacConfigStruct;
 	pit_config_t pitConfig;
+	uint16_t * outData_x;
+	uint16_t Ns_counter = 0;
 
 	pingPong_events = xEventGroupCreate();
-	pingPongA_buffer = xQueueCreate(NS, sizeof(uint16_t));
-	pingPongB_buffer = xQueueCreate(NS, sizeof(uint16_t));
+
+	pingPong_buffer = xQueueCreate(2, sizeof(uint16_t *));
 
 	DAC_GetDefaultConfig(&dacConfigStruct);
 	DAC_Init(DAC0, &dacConfigStruct);
@@ -191,27 +202,37 @@ void PIT_task(void * arg) {
 	PIT_SetTimerPeriod(PIT, 0, USEC_TO_COUNT(35U, PIT_SOURCE_CLOCK));
 
 	PIT_StartTimer(PIT, kPIT_Chnl_0);
-	BaseType_t xResult = pdPASS;
+
+	xEventGroupSetBits(pingPong_events, EVENT_BUFFER_EMPTY);
 
 	for (;;) {
 		if (true == pitIsrFlag) {
 			pitIsrFlag = false;
 
-			if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
-				xResult = xQueueReceive(pingPongB_buffer, &outData_x, 10);
-			} else {
-				xResult = xQueueReceive(pingPongA_buffer, &outData_x, 10);
+			if (EVENT_BUFFER_EMPTY & xEventGroupGetBits(pingPong_events)) {
+
+				if (xQueueReceive(pingPong_buffer, &outData_x,
+						portMAX_DELAY) == pdPASS) {
+					xEventGroupClearBits(pingPong_events, EVENT_BUFFER_EMPTY);
+
+				}
 			}
 
-			if (pdFAIL == xResult) {
-				outData_x = 2048;
-
+			if (NULL != outData_x) {
+				DAC_SetBufferValue(DAC0, 0U, *outData_x);
+				outData_x++;
+				Ns_counter++;
+				if (NS == Ns_counter) {
+					xEventGroupSetBits(pingPong_events, EVENT_BUFFER_EMPTY);
+					Ns_counter = 0;
+				}
 			}
 
-			DAC_SetBufferValue(DAC0, 0U, (outData_x));
+			vTaskDelay(10);
+
 		}
-
 	}
+
 }
 
 /*-----------------------------------------------------------------------------------*/
