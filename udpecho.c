@@ -46,9 +46,14 @@
 
 #include "fsl_dac.h"
 #include "fsl_pit.h"
+#include "fsl_gpio.h"
+#include "fsl_common.h"
+#include "fsl_port.h"
 
-#define NS 60
-#define CHARS 4
+#include "MK64F12.h"
+
+#define NS 300
+#define BYTES 2
 
 #define EVENT_PIT (1<<0)
 #define EVENT_PING_PONG (1<<1)
@@ -88,7 +93,7 @@ static void server_thread(void *arg) {
 	struct netbuf *buf;
 
 	uint8_t *msg;
-	uint8_t DAC_buffer[CHARS * NS] = { };
+	uint8_t DAC_buffer[BYTES * NS] = { };
 
 	uint16_t buffer_index = 0;
 	uint16_t len;
@@ -99,23 +104,40 @@ static void server_thread(void *arg) {
 	netconn_bind(conn, IP_ADDR_ANY, 5005);
 	//LWIP_ERROR("udpecho: invalid conn", (conn != NULL), return;);
 
+	CLOCK_EnableClock(kCLOCK_PortA);
+
+	port_pin_config_t config_switch = { kPORT_PullUp, kPORT_SlowSlewRate,
+			kPORT_PassiveFilterDisable, kPORT_OpenDrainDisable,
+			kPORT_LowDriveStrength, kPORT_MuxAsGpio, kPORT_UnlockRegister };
+
+	PORT_SetPinConfig(PORTA, 1, &config_switch);
+
+	gpio_pin_config_t switch_config_gpio = { kGPIO_DigitalOutput, 1 };
+
+	GPIO_PinInit(GPIOA, 1, &switch_config_gpio);
+
 	while (1) {
 
 		netconn_recv(conn, &buf);
 
-		if (ERR_OK == netbuf_data(buf, (void**) &msg, &len)) {
+		err_enum_t err = netbuf_data(buf, (void**) &msg, &len);
 
-			for (buffer_index = 0; buffer_index < len; buffer_index++) {
-				DAC_buffer[buffer_index] = *msg - '0';
+		if (ERR_OK == err) {
+
+			GPIO_WritePinOutput(GPIOA, 1, 1);
+			outData_x = 2048;
+
+			for (buffer_index = 0; buffer_index < (NS * BYTES);
+					buffer_index++) {
+				DAC_buffer[buffer_index] = *msg;
 				msg++;
 			}
 
-			for (uint8_t Ns_index = 0; Ns_index < (NS * CHARS); Ns_index += 4) {
+			for (uint16_t Ns_index = 0; Ns_index < (NS * BYTES); Ns_index +=
+					BYTES) {
 
-				outData_x = (DAC_buffer[Ns_index + 0] * 1000
-						+ DAC_buffer[Ns_index + 1] * 100
-						+ DAC_buffer[Ns_index + 2] * 10
-						+ DAC_buffer[Ns_index + 3] * 1);
+				outData_x = (DAC_buffer[Ns_index + 0]
+						+ (DAC_buffer[Ns_index + 1] << 8));
 
 				if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
 					xQueueSendToBack(pingPongA_buffer, &outData_x, 10);
@@ -132,18 +154,21 @@ static void server_thread(void *arg) {
 			}
 		}
 
-buffer_index = 0;
+		GPIO_WritePinOutput(GPIOA, 1, 0);
+
+		buffer_index = 0;
 
 		netbuf_delete(buf);
 
 	}
 }
 
+uint16_t outData_x;
+
 void PIT_task(void * arg) {
 
 	dac_config_t dacConfigStruct;
 	pit_config_t pitConfig;
-	uint16_t outData_x;
 
 	pingPong_events = xEventGroupCreate();
 	pingPongA_buffer = xQueueCreate(NS, sizeof(uint16_t));
@@ -163,18 +188,24 @@ void PIT_task(void * arg) {
 	/* Enable at the NVIC */
 	EnableIRQ(PIT_IRQ_ID);
 
-	PIT_SetTimerPeriod(PIT, 0, USEC_TO_COUNT(23U, PIT_SOURCE_CLOCK));
+	PIT_SetTimerPeriod(PIT, 0, USEC_TO_COUNT(35U, PIT_SOURCE_CLOCK));
 
 	PIT_StartTimer(PIT, kPIT_Chnl_0);
+	BaseType_t xResult = pdPASS;
 
 	for (;;) {
 		if (true == pitIsrFlag) {
 			pitIsrFlag = false;
 
 			if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
-				xQueueReceive(pingPongB_buffer, &outData_x, 10);
+				xResult = xQueueReceive(pingPongB_buffer, &outData_x, 10);
 			} else {
-				xQueueReceive(pingPongA_buffer, &outData_x, 10);
+				xResult = xQueueReceive(pingPongA_buffer, &outData_x, 10);
+			}
+
+			if (pdFAIL == xResult) {
+				outData_x = 2048;
+
 			}
 
 			DAC_SetBufferValue(DAC0, 0U, (outData_x));
@@ -185,7 +216,7 @@ void PIT_task(void * arg) {
 
 /*-----------------------------------------------------------------------------------*/
 void udpecho_init(void) {
-	sys_thread_new("server", server_thread, NULL, 300, 2);
+	sys_thread_new("server", server_thread, NULL, 600, 2);
 
 	xTaskCreate(PIT_task, "PIT task", 200, NULL, configMAX_PRIORITIES,
 	NULL);
