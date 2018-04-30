@@ -53,7 +53,7 @@
 
 #include "MK64F12.h"
 
-#define NS 500
+#define NS 1700 		// MAX 540
 #define BYTES 2
 
 #define EVENT_PIT (1<<0)
@@ -89,7 +89,8 @@ void PIT_FS_HANDLER(void) {
 			DAC_SetBufferValue(DAC0, 0U, (outData_x));
 
 		} else {
-			outData_x = pingpong_B[pingpongB_semaphore];
+			outData_x = *pingpong_B_ptr;
+			pingpong_B_ptr++;
 			pingpongB_semaphore++;
 
 		}
@@ -99,7 +100,8 @@ void PIT_FS_HANDLER(void) {
 			DAC_SetBufferValue(DAC0, 0U, (outData_x));
 
 		} else {
-			outData_x = pingpong_A[pingpongA_semaphore];
+			outData_x = *pingpong_A_ptr;
+			pingpong_A_ptr++;
 			pingpongA_semaphore++;
 
 		}
@@ -109,9 +111,13 @@ void PIT_FS_HANDLER(void) {
 
 }
 
-static void server_thread(void *arg) {
+/*-----------------------------------------------------------------------------------*/
+static void udpecho_thread(void *arg) {
+
 	struct netconn *conn;
 	struct netbuf *buf;
+	char buffer[4096];
+	err_t err;
 
 	uint8_t *msg;
 	uint8_t UDP_buffer[BYTES * NS] = { };
@@ -127,35 +133,39 @@ static void server_thread(void *arg) {
 	//LWIP_ERROR("udpecho: invalid conn", (conn != NULL), return;);
 
 	while (1) {
+		err = netconn_recv(conn, &buf);
 
-		netconn_recv(conn, &buf);
+		GPIO_WritePinOutput(GPIOA, 1, 1);
 
-		err_enum_t err = netbuf_data(buf, (void**) &msg, &len);
-
-		if (ERR_OK == err) {
-
-			xEventGroupSetBits(pingPong_events, EVENT_MAX_COUNT);
-
-			if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
-
-				netbuf_copy(buf, pingpong_B, len);
-				pingpongA_semaphore = 0;
-
-				xEventGroupClearBits(pingPong_events, EVENT_PING_PONG);
-
+		if (err == ERR_OK) {
+			/*  no need netconn_connect here, since the netbuf contains the address */
+			if (netbuf_copy(buf, buffer, sizeof(buffer)) != buf->p->tot_len) {
+				LWIP_DEBUGF(LWIP_DBG_ON, ("netbuf_copy failed\n"));
 			} else {
+				xEventGroupSetBits(pingPong_events, EVENT_MAX_COUNT);
 
-				netbuf_copy(buf, pingpong_A, len);
-				pingpongB_semaphore = 0;
+				if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
 
-				xEventGroupSetBits(pingPong_events, EVENT_PING_PONG);
+					pingpong_A_ptr = &buffer;
+					pingpongA_semaphore = 0;
+
+					xEventGroupClearBits(pingPong_events, EVENT_PING_PONG);
+
+				} else {
+
+					pingpong_B_ptr = &buffer;
+					pingpongB_semaphore = 0;
+
+					xEventGroupSetBits(pingPong_events, EVENT_PING_PONG);
+				}
+
 			}
 
-			buffer_index = 0;
-
-			netbuf_delete(buf);
-
 		}
+		buffer_index = 0;
+
+		GPIO_WritePinOutput(GPIOA, 1, 0);
+		netbuf_delete(buf);
 	}
 }
 
@@ -197,9 +207,10 @@ void udpecho_init(void) {
 
 	NVIC_SetPriority(PIT_IRQ_ID, 5);
 
-	PIT_SetTimerPeriod(PIT, 0, USEC_TO_COUNT(90U, PIT_SOURCE_CLOCK));
+	PIT_SetTimerPeriod(PIT, 0, USEC_TO_COUNT(23U, PIT_SOURCE_CLOCK));
 
-	sys_thread_new("server", server_thread, NULL, 600, 2);
+	sys_thread_new("udpecho_thread", udpecho_thread, NULL,
+	DEFAULT_THREAD_STACKSIZE, DEFAULT_THREAD_PRIO);
 
 	PIT_StartTimer(PIT, kPIT_Chnl_0);
 
