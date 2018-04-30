@@ -53,7 +53,7 @@
 
 #include "MK64F12.h"
 
-#define NS 300
+#define NS 500
 #define BYTES 2
 
 #define EVENT_PIT (1<<0)
@@ -81,10 +81,31 @@ uint16_t pingpongB_semaphore;
 void PIT_FS_HANDLER(void) {
 	/* Clear interrupt flag.*/
 	PIT_ClearStatusFlags(PIT, 0, kPIT_TimerFlag);
-	BaseType_t xHigherPriorityTaskWoken;
-	xHigherPriorityTaskWoken = pdFALSE;
-	xSemaphoreGiveFromISR(PIT_semaphore, &xHigherPriorityTaskWoken);
-	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+
+	if (EVENT_PING_PONG & xEventGroupGetBitsFromISR(pingPong_events)) {
+
+		if (NS == pingpongB_semaphore) {
+			outData_x = 2048;
+			DAC_SetBufferValue(DAC0, 0U, (outData_x));
+
+		} else {
+			outData_x = pingpong_B[pingpongB_semaphore];
+			pingpongB_semaphore++;
+
+		}
+	} else {
+		if (NS == pingpongA_semaphore) {
+			outData_x = 2048;
+			DAC_SetBufferValue(DAC0, 0U, (outData_x));
+
+		} else {
+			outData_x = pingpong_A[pingpongA_semaphore];
+			pingpongA_semaphore++;
+
+		}
+	}
+
+	DAC_SetBufferValue(DAC0, 0U, (outData_x));
 
 }
 
@@ -105,6 +126,42 @@ static void server_thread(void *arg) {
 	netconn_bind(conn, IP_ADDR_ANY, 50005);
 	//LWIP_ERROR("udpecho: invalid conn", (conn != NULL), return;);
 
+	while (1) {
+
+		netconn_recv(conn, &buf);
+
+		err_enum_t err = netbuf_data(buf, (void**) &msg, &len);
+
+		if (ERR_OK == err) {
+
+			xEventGroupSetBits(pingPong_events, EVENT_MAX_COUNT);
+
+			if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
+
+				netbuf_copy(buf, pingpong_B, len);
+				pingpongA_semaphore = 0;
+
+				xEventGroupClearBits(pingPong_events, EVENT_PING_PONG);
+
+			} else {
+
+				netbuf_copy(buf, pingpong_A, len);
+				pingpongB_semaphore = 0;
+
+				xEventGroupSetBits(pingPong_events, EVENT_PING_PONG);
+			}
+
+			buffer_index = 0;
+
+			netbuf_delete(buf);
+
+		}
+	}
+}
+
+/*-----------------------------------------------------------------------------------*/
+void udpecho_init(void) {
+
 	CLOCK_EnableClock(kCLOCK_PortA);
 
 	port_pin_config_t config_switch = { kPORT_PullUp, kPORT_SlowSlewRate,
@@ -117,68 +174,10 @@ static void server_thread(void *arg) {
 
 	GPIO_PinInit(GPIOA, 1, &switch_config_gpio);
 
-	while (1) {
-
-		netconn_recv(conn, &buf);
-
-		err_enum_t err = netbuf_data(buf, (void**) &msg, &len);
-
-		if (ERR_OK == err) {
-
-
-			xEventGroupSetBits(pingPong_events, EVENT_MAX_COUNT);
-
-			if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
-
-				for (buffer_index = 0; buffer_index < NS; buffer_index++) {
-					GPIO_PinWrite(GPIOA, 1, 0);
-					DAC_value = msg;
-					DAC_buffer[buffer_index] = *msg;
-					xQueueSendToBack(pingPongA_buffer, DAC_value, 1);
-					pingpongA_semaphore++;
-					msg++;
-					msg++;
-					DAC_value++;
-					GPIO_PinWrite(GPIOA, 1, 1);
-				}
-
-				xEventGroupClearBits(pingPong_events, EVENT_PING_PONG);
-
-			} else {
-
-				for (buffer_index = 0; buffer_index < NS; buffer_index++) {
-					GPIO_PinWrite(GPIOA, 1, 0);
-					DAC_value = msg;
-					xQueueSendToBack(pingPongB_buffer, DAC_value, 1);
-					pingpongB_semaphore++;
-					msg++;
-					msg++;
-					DAC_value++;
-					GPIO_PinWrite(GPIOA, 1, 1);
-				}
-
-				xEventGroupSetBits(pingPong_events, EVENT_PING_PONG);
-			}
-
-			buffer_index = 0;
-
-			netbuf_delete(buf);
-
-
-		}
-	}
-}
-
-uint16_t outData_x;
-
-void PIT_task(void * arg) {
-
 	dac_config_t dacConfigStruct;
 	pit_config_t pitConfig;
 
 	pingPong_events = xEventGroupCreate();
-	pingPongA_buffer = xQueueCreate(NS, sizeof(uint16_t));
-	pingPongB_buffer = xQueueCreate(NS, sizeof(uint16_t));
 
 	DAC_GetDefaultConfig(&dacConfigStruct);
 	DAC_Init(DAC0, &dacConfigStruct);
@@ -198,54 +197,11 @@ void PIT_task(void * arg) {
 
 	NVIC_SetPriority(PIT_IRQ_ID, 5);
 
-	PIT_SetTimerPeriod(PIT, 0, USEC_TO_COUNT(22U, PIT_SOURCE_CLOCK));
+	PIT_SetTimerPeriod(PIT, 0, USEC_TO_COUNT(90U, PIT_SOURCE_CLOCK));
 
-	PIT_StartTimer(PIT, kPIT_Chnl_0);
-
-	for (;;) {
-		xSemaphoreTake(PIT_semaphore, portMAX_DELAY);
-
-		if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
-
-			if (0 == pingpongB_semaphore) {
-				outData_x = 2048;
-				DAC_SetBufferValue(DAC0, 0U, (outData_x));
-				xEventGroupWaitBits(pingPong_events, EVENT_MAX_COUNT,
-				pdTRUE, pdFALSE, portMAX_DELAY);
-
-			} else {
-				pingpongB_semaphore--;
-				xQueueReceive(pingPongB_buffer, &outData_x, 1);
-
-			}
-		} else {
-			if (0 == pingpongA_semaphore) {
-				outData_x = 2048;
-				DAC_SetBufferValue(DAC0, 0U, (outData_x));
-				xEventGroupWaitBits(pingPong_events, EVENT_MAX_COUNT,
-				pdTRUE, pdFALSE, portMAX_DELAY);
-
-			} else {
-				pingpongA_semaphore--;
-				xQueueReceive(pingPongA_buffer, &outData_x, 1);
-
-			}
-		}
-
-		DAC_SetBufferValue(DAC0, 0U, (outData_x));
-
-	}
-}
-
-/*-----------------------------------------------------------------------------------*/
-void udpecho_init(void) {
 	sys_thread_new("server", server_thread, NULL, 600, 2);
 
-	pingpongA_semaphore = 0;
-	pingpongB_semaphore = 0;
-
-	xTaskCreate(PIT_task, "PIT task", 200, NULL, configMAX_PRIORITIES,
-	NULL);
+	PIT_StartTimer(PIT, kPIT_Chnl_0);
 
 }
 
