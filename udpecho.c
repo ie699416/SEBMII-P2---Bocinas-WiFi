@@ -1,164 +1,219 @@
 /*
-* The Clear BSD License
-* Copyright (c) 2016, Freescale Semiconductor, Inc.
- * Copyright 2016-2017 NXP
-* All rights reserved.
-*
-*
-* Redistribution and use in source and binary forms, with or without modification,
-* are permitted (subject to the limitations in the disclaimer below) provided
-* that the following conditions are met:
-*
-* o Redistributions of source code must retain the above copyright notice, this list
-*   of conditions and the following disclaimer.
-*
-* o Redistributions in binary form must reproduce the above copyright notice, this
-*   list of conditions and the following disclaimer in the documentation and/or
-*   other materials provided with the distribution.
-*
-* o Neither the name of the copyright holder nor the names of its
-*   contributors may be used to endorse or promote products derived from this
-*   software without specific prior written permission.
-*
-* NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY THIS LICENSE.
-* THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-* ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-* DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
-* ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
-* ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
+ * Copyright (c) 2001-2003 Swedish Institute of Computer Science.
+ * All rights reserved. 
+ * 
+ * Redistribution and use in source and binary forms, with or without modification, 
+ * are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ * 3. The name of the author may not be used to endorse or promote products
+ *    derived from this software without specific prior written permission. 
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED 
+ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF 
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT 
+ * SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, 
+ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT 
+ * OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN 
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING 
+ * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY 
+ * OF SUCH DAMAGE.
+ *
+ * This file is part of the lwIP TCP/IP stack.
+ * 
+ * Author: Adam Dunkels <adam@sics.se>
+ *
+ */
 
-/*******************************************************************************
- * Includes
- ******************************************************************************/
+#include "udpecho.h"
+
 #include "lwip/opt.h"
 
 #if LWIP_NETCONN
 
-#include "udpecho/udpecho.h"
-#include "lwip/tcpip.h"
-#include "netif/ethernet.h"
-#include "ethernetif.h"
+#include "lwip/api.h"
+#include "lwip/sys.h"
 
-#include "board.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "event_groups.h"
+#include "semphr.h"
 
-#include "fsl_device_registers.h"
-#include "pin_mux.h"
-#include "clock_config.h"
-/*******************************************************************************
- * Definitions
- ******************************************************************************/
+#include "fsl_dac.h"
+#include "fsl_pit.h"
+#include "fsl_gpio.h"
+#include "fsl_common.h"
+#include "fsl_port.h"
 
-/* IP address configuration. */
-#define configIP_ADDR0 192
-#define configIP_ADDR1 168
-#define configIP_ADDR2 1
-#define configIP_ADDR3 100
+#include "MK64F12.h"
 
-/* Netmask configuration. */
-#define configNET_MASK0 255
-#define configNET_MASK1 255
-#define configNET_MASK2 255
-#define configNET_MASK3 0
+#define NS 1740 		// MAX 540
+#define BYTES 2
 
-/* Gateway address configuration. */
-#define configGW_ADDR0 192
-#define configGW_ADDR1 168
-#define configGW_ADDR2 0
-#define configGW_ADDR3 100
+#define EVENT_PIT (1<<0)
+#define EVENT_PING_PONG (1<<1)
+#define EVENT_MAX_COUNT (1<<2)
 
-/* MAC address configuration. */
-#define configMAC_ADDR {0x02, 0x12, 0x13, 0x10, 0x15, 0x11}
+#define PIT_FS_HANDLER PIT0_IRQHandler
+#define PIT_IRQ_ID PIT0_IRQn
+#define USEC_TO_COUNT(us, clockFreqInHz) (uint64_t)((uint64_t)us * clockFreqInHz / 1000000U)
+#define PIT_SOURCE_CLOCK CLOCK_GetFreq(kCLOCK_BusClk)
 
-/* Address of PHY interface. */
-#define EXAMPLE_PHY_ADDRESS BOARD_ENET0_PHY_ADDRESS
+EventGroupHandle_t pingPong_events;
+QueueHandle_t pingPongA_buffer;
+QueueHandle_t pingPongB_buffer;
+SemaphoreHandle_t PIT_semaphore;
 
-/* System clock name. */
-#define EXAMPLE_CLOCK_NAME kCLOCK_CoreSysClk
+uint16_t pingpong_A[NS] = { };
+uint16_t pingpong_B[NS] = { };
+uint16_t outData_x;
+uint16_t * pingpong_A_ptr = pingpong_A;
+uint16_t * pingpong_B_ptr = pingpong_A;
+uint16_t pingpongA_semaphore;
+uint16_t pingpongB_semaphore;
 
+void PIT_FS_HANDLER(void) {
+	/* Clear interrupt flag.*/
+	PIT_ClearStatusFlags(PIT, 0, kPIT_TimerFlag);
 
-/*! @brief Stack size of the temporary lwIP initialization thread. */
-#define INIT_THREAD_STACKSIZE 1024
+	if (EVENT_PING_PONG & xEventGroupGetBitsFromISR(pingPong_events)) {
 
-/*! @brief Priority of the temporary lwIP initialization thread. */
-#define INIT_THREAD_PRIO DEFAULT_THREAD_PRIO
+		if (NS == pingpongB_semaphore) {
+			outData_x = 2048;
+			DAC_SetBufferValue(DAC0, 0U, (outData_x));
 
-/*******************************************************************************
-* Prototypes
-******************************************************************************/
+		} else {
+			outData_x = *pingpong_B_ptr;
+			pingpong_B_ptr++;
+			pingpongB_semaphore++;
 
-/*******************************************************************************
-* Variables
-******************************************************************************/
+		}
+	} else {
+		if (NS == pingpongA_semaphore) {
+			outData_x = 2048;
+			DAC_SetBufferValue(DAC0, 0U, (outData_x));
 
-/*******************************************************************************
- * Code
- ******************************************************************************/
+		} else {
+			outData_x = *pingpong_A_ptr;
+			pingpong_A_ptr++;
+			pingpongA_semaphore++;
 
-/*!
- * @brief Initializes lwIP stack.
- */
-static void stack_init(void *arg)
-{
-    static struct netif fsl_netif0;
-    ip4_addr_t fsl_netif0_ipaddr, fsl_netif0_netmask, fsl_netif0_gw;
-    ethernetif_config_t fsl_enet_config0 = {
-        .phyAddress = EXAMPLE_PHY_ADDRESS,
-        .clockName = EXAMPLE_CLOCK_NAME,
-        .macAddress = configMAC_ADDR,
-    };
+		}
+	}
 
-    IP4_ADDR(&fsl_netif0_ipaddr, configIP_ADDR0, configIP_ADDR1, configIP_ADDR2, configIP_ADDR3);
-    IP4_ADDR(&fsl_netif0_netmask, configNET_MASK0, configNET_MASK1, configNET_MASK2, configNET_MASK3);
-    IP4_ADDR(&fsl_netif0_gw, configGW_ADDR0, configGW_ADDR1, configGW_ADDR2, configGW_ADDR3);
+	DAC_SetBufferValue(DAC0, 0U, (outData_x));
 
-    tcpip_init(NULL, NULL);
-
-    netif_add(&fsl_netif0, &fsl_netif0_ipaddr, &fsl_netif0_netmask, &fsl_netif0_gw,
-              &fsl_enet_config0, ethernetif0_init, tcpip_input);
-    netif_set_default(&fsl_netif0);
-    netif_set_up(&fsl_netif0);
-
-    PRINTF("\r\n************************************************\r\n");
-    PRINTF(" UDP Echo example\r\n");
-    PRINTF("************************************************\r\n");
-    PRINTF(" IPv4 Address     : %u.%u.%u.%u\r\n", ((u8_t *)&fsl_netif0_ipaddr)[0], ((u8_t *)&fsl_netif0_ipaddr)[1],
-           ((u8_t *)&fsl_netif0_ipaddr)[2], ((u8_t *)&fsl_netif0_ipaddr)[3]);
-    PRINTF(" IPv4 Subnet mask : %u.%u.%u.%u\r\n", ((u8_t *)&fsl_netif0_netmask)[0], ((u8_t *)&fsl_netif0_netmask)[1],
-           ((u8_t *)&fsl_netif0_netmask)[2], ((u8_t *)&fsl_netif0_netmask)[3]);
-    PRINTF(" IPv4 Gateway     : %u.%u.%u.%u\r\n", ((u8_t *)&fsl_netif0_gw)[0], ((u8_t *)&fsl_netif0_gw)[1],
-           ((u8_t *)&fsl_netif0_gw)[2], ((u8_t *)&fsl_netif0_gw)[3]);
-    PRINTF("************************************************\r\n");
-
-    udpecho_init();
-
-    vTaskDelete(NULL);
 }
 
-/*!
- * @brief Main function
- */
-int main(void)
-{
-    SYSMPU_Type *base = SYSMPU;
-    BOARD_InitPins();
-    BOARD_BootClockRUN();
-    BOARD_InitDebugConsole();
-    /* Disable SYSMPU. */
-    base->CESR &= ~SYSMPU_CESR_VLD_MASK;
+/*-----------------------------------------------------------------------------------*/
+static void udpecho_thread(void *arg) {
 
-    /* Initialize lwIP from thread */
-    if(sys_thread_new("main", stack_init, NULL, INIT_THREAD_STACKSIZE, INIT_THREAD_PRIO) == NULL)
-        LWIP_ASSERT("main(): Task creation failed.", 0);
+	struct netconn *conn;
+	struct netbuf *buf;
+	char buffer[4096];
+	err_t err;
 
-    vTaskStartScheduler();
+	uint8_t *msg;
+	uint8_t UDP_buffer[BYTES * NS] = { };
+	uint16_t DAC_buffer[NS];
+	uint16_t * DAC_value;
 
-    /* Will not get here unless a task calls vTaskEndScheduler ()*/
-    return 0;
+	uint16_t buffer_index = 0;
+	uint16_t len;
+
+	LWIP_UNUSED_ARG(arg);
+	conn = netconn_new(NETCONN_UDP);
+	netconn_bind(conn, IP_ADDR_ANY, 50005);
+	//LWIP_ERROR("udpecho: invalid conn", (conn != NULL), return;);
+
+	while (1) {
+		err = netconn_recv(conn, &buf);
+
+		GPIO_WritePinOutput(GPIOA, 1, 1);
+
+		if (err == ERR_OK) {
+			/*  no need netconn_connect here, since the netbuf contains the address */
+			if (netbuf_copy(buf, buffer, sizeof(buffer)) != buf->p->tot_len) {
+				LWIP_DEBUGF(LWIP_DBG_ON, ("netbuf_copy failed\n"));
+			} else {
+				xEventGroupSetBits(pingPong_events, EVENT_MAX_COUNT);
+
+				if (EVENT_PING_PONG & xEventGroupGetBits(pingPong_events)) {
+
+					pingpong_A_ptr = &buffer;
+					pingpongA_semaphore = 0;
+
+					xEventGroupClearBits(pingPong_events, EVENT_PING_PONG);
+
+				} else {
+
+					pingpong_B_ptr = &buffer;
+					pingpongB_semaphore = 0;
+
+					xEventGroupSetBits(pingPong_events, EVENT_PING_PONG);
+				}
+
+			}
+
+		}
+		buffer_index = 0;
+
+		GPIO_WritePinOutput(GPIOA, 1, 0);
+		netbuf_delete(buf);
+	}
 }
-#endif
+
+/*-----------------------------------------------------------------------------------*/
+void udpecho_init(void) {
+
+	CLOCK_EnableClock(kCLOCK_PortA);
+
+	port_pin_config_t config_switch = { kPORT_PullUp, kPORT_SlowSlewRate,
+			kPORT_PassiveFilterDisable, kPORT_OpenDrainDisable,
+			kPORT_LowDriveStrength, kPORT_MuxAsGpio, kPORT_UnlockRegister };
+
+	PORT_SetPinConfig(PORTA, 1, &config_switch);
+
+	gpio_pin_config_t switch_config_gpio = { kGPIO_DigitalOutput, 1 };
+
+	GPIO_PinInit(GPIOA, 1, &switch_config_gpio);
+
+	dac_config_t dacConfigStruct;
+	pit_config_t pitConfig;
+
+	pingPong_events = xEventGroupCreate();
+
+	DAC_GetDefaultConfig(&dacConfigStruct);
+	DAC_Init(DAC0, &dacConfigStruct);
+	DAC_Enable(DAC0, true); /* Enable output. */
+
+	PIT_GetDefaultConfig(&pitConfig);
+
+	PIT_semaphore = xSemaphoreCreateBinary();
+
+	PIT_Init(PIT, &pitConfig);
+
+	/* Enable timer interrupts for channel 0 */
+	PIT_EnableInterrupts(PIT, kPIT_Chnl_0, kPIT_TimerInterruptEnable);
+
+	/* Enable at the NVIC */
+	EnableIRQ(PIT_IRQ_ID);
+
+	NVIC_SetPriority(PIT_IRQ_ID, 5);
+
+	PIT_SetTimerPeriod(PIT, 0, USEC_TO_COUNT(23U, PIT_SOURCE_CLOCK));
+
+	sys_thread_new("udpecho_thread", udpecho_thread, NULL,
+	DEFAULT_THREAD_STACKSIZE, DEFAULT_THREAD_PRIO);
+
+	PIT_StartTimer(PIT, kPIT_Chnl_0);
+
+}
+
+#endif /* LWIP_NETCONN */
