@@ -53,7 +53,7 @@
 
 #include "MK64F12.h"
 
-#define NS 1740 		// MAX 540
+#define NS 430 		// MAX 540
 #define BYTES 2
 
 #define EVENT_PIT (1<<0)
