@@ -39,6 +39,7 @@
 #include "lwip/sys.h"
 #include "lwip/api.h"
 
+
 #define OPTION_ONE 49
 #define OPTION_TWO 50
 #define OPTION_TREE 51
@@ -57,16 +58,15 @@
 
 #include "MK64F12.h"
 
-#define NS 700 		// MAX 540
+#define NS 434 		// MAX 540
 #define BYTES 2
+#define FS 23U
 
 #define EVENT_PIT (1<<0)
 #define EVENT_PING_PONG (1<<1)
 #define EVENT_MAX_COUNT (1<<2)
 #define EVENT_BIND (1<<3)
 
-#define EVENT_PLAY_PAUSE (1<<1)
-#define EVENT_SWITCH_SONG (1<<2)
 
 #define PIT_FS_HANDLER PIT0_IRQHandler
 #define PIT_IRQ_ID PIT0_IRQn
@@ -74,7 +74,9 @@
 #define PIT_SOURCE_CLOCK CLOCK_GetFreq(kCLOCK_BusClk)
 
 EventGroupHandle_t pingPong_events;
-EventGroupHandle_t tcp_events;
+QueueHandle_t pingPongA_buffer;
+QueueHandle_t pingPongB_buffer;
+SemaphoreHandle_t PIT_semaphore;
 
 uint16_t outData_x;
 
@@ -82,8 +84,6 @@ int16_t * pingpong_A_ptr;
 int16_t * pingpong_B_ptr;
 uint16_t pingpongA_semaphore;
 uint16_t pingpongB_semaphore;
-
-struct netconn *connUDP;
 
 void PIT_FS_HANDLER(void) {
 	/* Clear interrupt flag.*/
@@ -115,6 +115,8 @@ void PIT_FS_HANDLER(void) {
 	DAC_SetBufferValue(DAC0, 0U, (outData_x));
 
 }
+
+
 
 /*-----------------------------------------------------------------------------------*/
 static void tcpecho_thread(void *arg) {
@@ -151,7 +153,7 @@ static void tcpecho_thread(void *arg) {
 			"calidad de la com = %\n\r";
 	u16_t len;
 
-	char getCharTCP[5];
+	char example[5];
 
 	while (1) {
 
@@ -161,48 +163,20 @@ static void tcpecho_thread(void *arg) {
 		/* Process the new connection. */
 		if (err == ERR_OK) {
 
+
 			netconn_write(newconn, menu, 125, NETCONN_COPY);
 			while ((err = netconn_recv(newconn, &buf)) == ERR_OK) {
 				/*printf("Recved\n");*/
 				do {
 					netbuf_data(buf, &data, &len);
-					netbuf_copy(buf, getCharTCP, 5);
+					netbuf_copy(buf, example, 5);
 
-					if (getCharTCP[0] == OPTION_ONE) {
+					if (example[0] == OPTION_ONE) {
 						netconn_write(newconn, opcion1String, 65, NETCONN_COPY);
-
-						if (EVENT_PLAY_PAUSE & xEventGroupGetBits(tcp_events)) {
-
-							DAC_Enable(DAC0, true);
-
-							xEventGroupClearBits(tcp_events,
-							EVENT_PLAY_PAUSE);
-
-						} else {
-
-							DAC_Enable(DAC0, false);
-
-							xEventGroupSetBits(tcp_events,
-							EVENT_PLAY_PAUSE);
-						}
-
-					} else if (getCharTCP[0] == OPTION_TWO) {
+					} else if (example[0] == OPTION_TWO) {
 						netconn_write(newconn, opcion2String, 60, NETCONN_COPY);
 						netconn_write(newconn, menu, 125, NETCONN_COPY);
-
-						if (EVENT_SWITCH_SONG & xEventGroupGetBits(tcp_events)) {
-
-							netconn_bind(connUDP, IP4_ADDR_ANY, 50005);
-
-							xEventGroupClearBits(tcp_events, EVENT_SWITCH_SONG);
-
-						} else {
-
-							netconn_bind(connUDP, IP4_ADDR_ANY, 50007);
-
-							xEventGroupSetBits(tcp_events, EVENT_SWITCH_SONG);
-						}
-					} else if (getCharTCP[0] == OPTION_TREE) {
+					} else if (example[0] == OPTION_TREE) {
 						netconn_write(newconn, opcion3String, 65, NETCONN_COPY);
 					}
 //             err = netconn_write(newconn, data, len, NETCONN_COPY);//echo
@@ -222,12 +196,13 @@ static void tcpecho_thread(void *arg) {
 	}
 }
 
+
 /*-----------------------------------------------------------------------------------*/
 static void udpecho_thread(void *arg) {
 
-	xEventGroupWaitBits(pingPong_events, EVENT_BIND, pdTRUE, pdFALSE,
-	portMAX_DELAY);
+	xEventGroupWaitBits(pingPong_events, EVENT_BIND, pdTRUE, pdFALSE, portMAX_DELAY);
 
+	struct netconn *conn;
 	struct netbuf *buf;
 	char buffer[4096];
 	err_t err;
@@ -236,12 +211,12 @@ static void udpecho_thread(void *arg) {
 	IP4_ADDR(&dst_ip, 192, 168, 1, 65);
 
 	LWIP_UNUSED_ARG(arg);
-	connUDP = netconn_new(NETCONN_UDP);
-	netconn_bind(connUDP, IP4_ADDR_ANY, 50005);
+	conn = netconn_new(NETCONN_UDP);
+	netconn_bind(conn, IP4_ADDR_ANY, 50005);
 	//LWIP_ERROR("udpecho: invalid conn", (conn != NULL), return;);
 
 	while (1) {
-		err = netconn_recv(connUDP, &buf);
+		err = netconn_recv(conn, &buf);
 
 		GPIO_WritePinOutput(GPIOA, 1, 1);
 
@@ -295,13 +270,14 @@ void udpecho_init(void) {
 	pit_config_t pitConfig;
 
 	pingPong_events = xEventGroupCreate();
-	tcp_events = xEventGroupCreate();
 
 	DAC_GetDefaultConfig(&dacConfigStruct);
 	DAC_Init(DAC0, &dacConfigStruct);
 	DAC_Enable(DAC0, true); /* Enable output. */
 
 	PIT_GetDefaultConfig(&pitConfig);
+
+	PIT_semaphore = xSemaphoreCreateBinary();
 
 	PIT_Init(PIT, &pitConfig);
 
@@ -313,13 +289,14 @@ void udpecho_init(void) {
 
 	NVIC_SetPriority(PIT_IRQ_ID, 5);
 
-	PIT_SetTimerPeriod(PIT, 0, USEC_TO_COUNT(23U, PIT_SOURCE_CLOCK));
+	PIT_SetTimerPeriod(PIT, 0, USEC_TO_COUNT(FS, PIT_SOURCE_CLOCK));
 
 	sys_thread_new("tcpecho_thread", tcpecho_thread, NULL,
-	DEFAULT_THREAD_STACKSIZE, DEFAULT_THREAD_PRIO);
+			DEFAULT_THREAD_STACKSIZE, DEFAULT_THREAD_PRIO);
 
 	sys_thread_new("udpecho_thread", udpecho_thread, NULL,
 	DEFAULT_THREAD_STACKSIZE, DEFAULT_THREAD_PRIO - 1);
+
 
 	PIT_StartTimer(PIT, kPIT_Chnl_0);
 
